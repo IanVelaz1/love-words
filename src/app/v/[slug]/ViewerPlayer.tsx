@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect } from "react";
-import { loadAudioBuffer, createMixer, playBuffer, formatDuration } from "@/lib/audio";
+import { formatDuration } from "@/lib/audio";
 import type { Creation, WordTimestamp } from "@/lib/supabase/types";
 
 interface Props {
@@ -91,13 +91,17 @@ export function ViewerPlayer({ creation }: Props) {
   const [elapsed, setElapsed] = useState(0);
   const [duration, setDuration] = useState(voice_duration_sec ?? 0);
 
+  // HTMLAudioElement refs — the browser handles codec compatibility natively
+  const voiceElRef = useRef<HTMLAudioElement | null>(null);
+  const musicElRef = useRef<HTMLAudioElement | null>(null);
+
+  // Web Audio API refs — created inside handlePlay (inside user gesture, required by iOS)
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const voiceSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const musicSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const startTimeRef = useRef<number>(0);
+  const voiceGainRef = useRef<GainNode | null>(null);
+  const musicGainRef = useRef<GainNode | null>(null);
+  const audioInitRef = useRef(false); // createMediaElementSource can only be called once per element
+
   const rafRef = useRef<number | null>(null);
-  const voiceBufferRef = useRef<AudioBuffer | null>(null);
-  const musicBufferRef = useRef<AudioBuffer | null>(null);
 
   // After showing dedication, transition to ready
   useEffect(() => {
@@ -105,73 +109,123 @@ export function ViewerPlayer({ creation }: Props) {
     return () => clearTimeout(timer);
   }, []);
 
-  // Preload audio buffers
+  // Preload: create Audio elements early — browser buffers in the background
   useEffect(() => {
-    async function preload() {
-      try {
-        const ctx = new AudioContext();
-        audioCtxRef.current = ctx;
+    if (voice_audio_signed_url) {
+      const el = new Audio();
+      // crossOrigin must be set before src to avoid tainted canvas issues
+      el.crossOrigin = "anonymous";
+      el.preload = "auto";
+      el.src = voice_audio_signed_url;
+      voiceElRef.current = el;
 
-        if (voice_audio_signed_url) {
-          const vBuf = await loadAudioBuffer(ctx, voice_audio_signed_url);
-          voiceBufferRef.current = vBuf;
-          setDuration(vBuf.duration);
-        }
-
-        if (music_preview_url) {
-          const mBuf = await loadAudioBuffer(ctx, music_preview_url);
-          musicBufferRef.current = mBuf;
-        }
-      } catch (e) {
-        console.error("Audio preload error:", e);
-      }
+      el.addEventListener("loadedmetadata", () => setDuration(el.duration));
     }
-    preload();
+
+    if (music_preview_url) {
+      const el = new Audio();
+      el.crossOrigin = "anonymous";
+      el.preload = "auto";
+      el.loop = true;
+      el.src = music_preview_url;
+      musicElRef.current = el;
+    }
+
+    return () => {
+      voiceElRef.current?.pause();
+      musicElRef.current?.pause();
+    };
   }, [voice_audio_signed_url, music_preview_url]);
 
   const syncCaptions = useCallback(() => {
-    const ctx = audioCtxRef.current;
-    if (!ctx || !voiceSourceRef.current) return;
+    const voiceEl = voiceElRef.current;
+    if (!voiceEl || voiceEl.paused) return;
 
-    const currentTime = ctx.currentTime - startTimeRef.current;
+    const currentTime = voiceEl.currentTime;
     setElapsed(currentTime);
 
-    const idx = (transcription as WordTimestamp[]).findIndex(
-      (w, i) => {
-        const next = (transcription as WordTimestamp[])[i + 1];
-        return currentTime >= w.start && (next ? currentTime < next.start : true);
-      }
-    );
+    const idx = (transcription as WordTimestamp[]).findIndex((w, i) => {
+      const next = (transcription as WordTimestamp[])[i + 1];
+      return currentTime >= w.start && (next ? currentTime < next.start : true);
+    });
     setActiveWordIndex(idx);
 
-    if (currentTime < duration) {
-      rafRef.current = requestAnimationFrame(syncCaptions);
-    }
-  }, [transcription, duration]);
+    rafRef.current = requestAnimationFrame(syncCaptions);
+  }, [transcription]);
 
   async function handlePlay() {
-    const ctx = audioCtxRef.current;
-    if (!ctx || !voiceBufferRef.current) return;
+    const voiceEl = voiceElRef.current;
+    if (!voiceEl) return;
 
-    if (ctx.state === "suspended") await ctx.resume();
+    // Reset for replay
+    voiceEl.currentTime = 0;
+    setElapsed(0);
+    const musicEl = musicElRef.current;
+    if (musicEl) musicEl.currentTime = 0;
 
-    const { voiceGain: vGain, musicGain: mGain } = createMixer(ctx);
-    vGain.gain.value = voice_gain;
-    mGain.gain.value = 0; // Music fades in
+    // ── Web Audio API setup (first play only) ─────────────────────────────
+    // AudioContext must be created inside a user gesture on iOS Safari
+    if (!audioInitRef.current) {
+      try {
+        const ctx = new AudioContext();
+        audioCtxRef.current = ctx;
+        if (ctx.state === "suspended") await ctx.resume();
 
-    voiceSourceRef.current = playBuffer(ctx, voiceBufferRef.current, vGain);
-    startTimeRef.current = ctx.currentTime;
+        // Voice gain node
+        const vGain = ctx.createGain();
+        vGain.gain.value = voice_gain;
+        vGain.connect(ctx.destination);
+        voiceGainRef.current = vGain;
 
-    if (musicBufferRef.current) {
-      musicSourceRef.current = playBuffer(ctx, musicBufferRef.current, mGain, true);
-      // Fade music in after 1.5s
-      mGain.gain.setValueAtTime(0, ctx.currentTime);
-      mGain.gain.linearRampToValueAtTime(music_gain, ctx.currentTime + 3);
+        const vSrc = ctx.createMediaElementSource(voiceEl);
+        vSrc.connect(vGain);
+
+        // Music gain node (try CORS; Jamendo CDN supports it)
+        if (musicEl) {
+          try {
+            const mGain = ctx.createGain();
+            mGain.gain.value = 0;
+            mGain.connect(ctx.destination);
+            musicGainRef.current = mGain;
+
+            const mSrc = ctx.createMediaElementSource(musicEl);
+            mSrc.connect(mGain);
+          } catch {
+            // CORS rejected — music falls back to element .volume below
+            musicGainRef.current = null;
+          }
+        }
+
+        audioInitRef.current = true;
+      } catch {
+        // Web Audio API unavailable — plain HTML audio volume fallback
+        voiceEl.volume = voice_gain;
+        if (musicEl) musicEl.volume = music_gain;
+      }
     }
 
-    voiceSourceRef.current.onended = () => {
+    // ── Fade music in ─────────────────────────────────────────────────────
+    if (musicEl) {
+      const ctx = audioCtxRef.current;
+      const mGain = musicGainRef.current;
+      if (ctx && mGain) {
+        // Smooth 3-second ramp via Web Audio API
+        mGain.gain.cancelScheduledValues(ctx.currentTime);
+        mGain.gain.setValueAtTime(0, ctx.currentTime);
+        mGain.gain.linearRampToValueAtTime(music_gain, ctx.currentTime + 3);
+      } else {
+        // Fallback: step volume after a short delay
+        musicEl.volume = 0;
+        setTimeout(() => { if (musicEl) musicEl.volume = music_gain; }, 1500);
+      }
+      musicEl.play().catch(() => {});
+    }
+
+    await voiceEl.play();
+
+    voiceEl.onended = () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      musicSourceRef.current?.stop();
+      if (musicEl) { musicEl.pause(); musicEl.currentTime = 0; }
       setPhase("ended");
       setActiveWordIndex(-1);
     };

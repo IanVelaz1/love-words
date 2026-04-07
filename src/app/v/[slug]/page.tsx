@@ -1,7 +1,10 @@
 import { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { ViewerPlayer } from "./ViewerPlayer";
 import type { Creation } from "@/lib/supabase/types";
+import { ViewerPlayer } from "./ViewerPlayer";
+
+// Viewer pages are fully dynamic: signed URLs expire and view counts change
+export const dynamic = "force-dynamic";
 
 interface PageProps {
   params: Promise<{ slug: string }>;

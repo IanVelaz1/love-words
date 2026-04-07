@@ -56,11 +56,21 @@ export function StepRecorder() {
       source.connect(analyserRef.current);
       animateWaveform();
 
-      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      // Prefer webm/opus on desktop; fall back to mp4 for iOS Safari
+      const mimeType = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4;codecs=aac",
+        "audio/mp4",
+        "audio/ogg;codecs=opus",
+      ].find((t) => MediaRecorder.isTypeSupported(t)) ?? "";
+
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       chunksRef.current = [];
       mr.ondataavailable = (e) => chunksRef.current.push(e.data);
       mr.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        const blobType = mimeType || "audio/webm";
+        const blob = new Blob(chunksRef.current, { type: blobType });
         const url = URL.createObjectURL(blob);
         setLocalPreviewUrl(url);
         setAudioBlob(blob, recordingTime);
@@ -103,8 +113,10 @@ export function StepRecorder() {
 
       // Step 1: Transcribe by sending the blob directly (no storage round-trip needed)
       setIsTranscribing(true);
+      const blobMime = audioBlob.type || "audio/webm";
+      const ext = blobMime.includes("mp4") ? "mp4" : "webm";
       const transcribeForm = new FormData();
-      transcribeForm.append("file", audioBlob, "audio.webm");
+      transcribeForm.append("file", audioBlob, `audio.${ext}`);
 
       const res = await fetch("/api/transcribe", {
         method: "POST",
@@ -121,10 +133,10 @@ export function StepRecorder() {
 
       // Step 2: Upload audio to storage for later use in the viewer
       setIsUploading(true);
-      const filename = `${user.id}/${Date.now()}.webm`;
+      const filename = `${user.id}/${Date.now()}.${ext}`;
       const { error: uploadError } = await supabase.storage
         .from("voice-audio")
-        .upload(filename, audioBlob, { contentType: "audio/webm", upsert: true });
+        .upload(filename, audioBlob, { contentType: blobMime, upsert: true });
 
       if (uploadError) {
         // Storage upload failed — log it but don't block the flow.

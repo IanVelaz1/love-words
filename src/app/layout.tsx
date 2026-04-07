@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Inter, Lora } from "next/font/google";
 import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
@@ -17,6 +17,12 @@ const lora = Lora({
 export const metadata: Metadata = {
   title: "Love Words — Share your voice",
   description: "Record your words, add music, and surprise someone you love.",
+};
+
+// Next.js 15: viewport must be a separate export, not part of metadata
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
 };
 
 export default function RootLayout({
