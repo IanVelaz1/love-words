@@ -39,6 +39,7 @@ function CaptionWindow({
   return (
     <div className="flex flex-col items-center gap-3 min-h-36 justify-center">
       {/* Past — very faded, small */}
+      
       <p
         className="font-serif text-white/25 text-sm leading-snug text-center
                    w-full max-w-[min(100%,22rem)] px-4
