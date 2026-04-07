@@ -91,12 +91,15 @@ export function ViewerPlayer({ creation }: Props) {
   const [elapsed, setElapsed] = useState(0);
   const [duration, setDuration] = useState(voice_duration_sec ?? 0);
 
-  // HTMLAudioElement refs — the browser handles codec compatibility natively
+  // Voice uses HTMLAudioElement + createMediaElementSource (Supabase has CORS)
   const voiceElRef = useRef<HTMLAudioElement | null>(null);
-  const musicElRef = useRef<HTMLAudioElement | null>(null);
 
-  // Web Audio API refs — only used for voice (Supabase supports CORS)
-  // Music uses plain HTMLAudioElement.volume since Jamendo CDN lacks CORS headers
+  // Music uses AudioBufferSourceNode (fetched via our proxy to avoid CORS issues
+  // with Jamendo, and because iOS ignores HTMLAudioElement.volume)
+  const musicBufferRef = useRef<AudioBuffer | null>(null);
+  const musicSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const musicGainRef = useRef<GainNode | null>(null);
+
   const audioCtxRef = useRef<AudioContext | null>(null);
   const voiceGainRef = useRef<GainNode | null>(null);
   const audioInitRef = useRef(false);
@@ -109,35 +112,43 @@ export function ViewerPlayer({ creation }: Props) {
     return () => clearTimeout(timer);
   }, []);
 
-  // Preload: create Audio elements early — browser buffers in the background
+  // Preload voice element (browser handles codec natively)
   useEffect(() => {
     if (voice_audio_signed_url) {
       const el = new Audio();
-      // crossOrigin must be set before src to avoid tainted canvas issues
       el.crossOrigin = "anonymous";
       el.preload = "auto";
       el.src = voice_audio_signed_url;
       voiceElRef.current = el;
-
       el.addEventListener("loadedmetadata", () => setDuration(el.duration));
     }
+    return () => { voiceElRef.current?.pause(); };
+  }, [voice_audio_signed_url]);
 
-    if (music_preview_url) {
-      const el = new Audio();
-      // No crossOrigin — Jamendo CDN doesn't send CORS headers.
-      // Without this, mobile Safari blocks the resource entirely.
-      el.preload = "auto";
-      el.loop = true;
-      el.src = music_preview_url;
-      el.volume = 0;
-      musicElRef.current = el;
-    }
+  // Preload music as AudioBuffer via our proxy (avoids CORS + enables GainNode on iOS)
+  useEffect(() => {
+    if (!music_preview_url) return;
+    let cancelled = false;
 
-    return () => {
-      voiceElRef.current?.pause();
-      musicElRef.current?.pause();
-    };
-  }, [voice_audio_signed_url, music_preview_url]);
+    (async () => {
+      try {
+        const proxyUrl = `/api/audio-proxy?url=${encodeURIComponent(music_preview_url)}`;
+        const res = await fetch(proxyUrl);
+        if (!res.ok || cancelled) return;
+        const arrayBuffer = await res.arrayBuffer();
+        if (cancelled) return;
+
+        const ctx = new AudioContext();
+        const buffer = await ctx.decodeAudioData(arrayBuffer);
+        await ctx.close();
+        if (!cancelled) musicBufferRef.current = buffer;
+      } catch {
+        // Music is optional — voice still works without it
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [music_preview_url]);
 
   const syncCaptions = useCallback(() => {
     const voiceEl = voiceElRef.current;
@@ -159,22 +170,21 @@ export function ViewerPlayer({ creation }: Props) {
     const voiceEl = voiceElRef.current;
     if (!voiceEl) return;
 
-    // Reset for replay
     voiceEl.currentTime = 0;
     setElapsed(0);
-    const musicEl = musicElRef.current;
-    if (musicEl) musicEl.currentTime = 0;
 
-    // ── Web Audio API setup for voice only (first play) ────────────────────
-    // AudioContext must be created inside a user gesture on iOS Safari.
-    // Music is NOT routed through Web Audio — Jamendo lacks CORS headers,
-    // which causes mobile Safari to block the resource entirely.
+    // Stop any previous music source
+    musicSourceRef.current?.stop();
+    musicSourceRef.current = null;
+
+    // ── Web Audio API setup (first play, inside user gesture for iOS) ─────
     if (!audioInitRef.current) {
       try {
         const ctx = new AudioContext();
         audioCtxRef.current = ctx;
         if (ctx.state === "suspended") await ctx.resume();
 
+        // Voice: HTMLAudioElement → MediaElementSource → GainNode → destination
         const vGain = ctx.createGain();
         vGain.gain.value = voice_gain;
         vGain.connect(ctx.destination);
@@ -183,33 +193,46 @@ export function ViewerPlayer({ creation }: Props) {
         const vSrc = ctx.createMediaElementSource(voiceEl);
         vSrc.connect(vGain);
 
+        // Music: GainNode (source attached per-play since BufferSource is one-shot)
+        const mGain = ctx.createGain();
+        mGain.gain.value = 0;
+        mGain.connect(ctx.destination);
+        musicGainRef.current = mGain;
+
         audioInitRef.current = true;
       } catch {
         voiceEl.volume = voice_gain;
       }
+    } else {
+      const ctx = audioCtxRef.current;
+      if (ctx?.state === "suspended") await ctx.resume();
     }
 
-    // ── Fade music in via element volume (no CORS needed) ────────────────
-    if (musicEl) {
-      musicEl.volume = 0;
-      musicEl.play().catch(() => {});
+    // ── Start music via AudioBufferSourceNode + GainNode ─────────────────
+    const musicBuffer = musicBufferRef.current;
+    const ctx = audioCtxRef.current;
+    const mGain = musicGainRef.current;
 
-      const target = music_gain;
-      const steps = 30;
-      const intervalMs = 100;
-      let step = 0;
-      const fadeTimer = setInterval(() => {
-        step++;
-        musicEl.volume = Math.min(target, (target * step) / steps);
-        if (step >= steps) clearInterval(fadeTimer);
-      }, intervalMs);
+    if (musicBuffer && ctx && mGain) {
+      const source = ctx.createBufferSource();
+      source.buffer = musicBuffer;
+      source.loop = true;
+      source.connect(mGain);
+      source.start(0);
+      musicSourceRef.current = source;
+
+      // 3-second fade-in
+      mGain.gain.cancelScheduledValues(ctx.currentTime);
+      mGain.gain.setValueAtTime(0, ctx.currentTime);
+      mGain.gain.linearRampToValueAtTime(music_gain, ctx.currentTime + 3);
     }
 
     await voiceEl.play();
 
     voiceEl.onended = () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      if (musicEl) { musicEl.pause(); musicEl.currentTime = 0; }
+      musicSourceRef.current?.stop();
+      musicSourceRef.current = null;
       setPhase("ended");
       setActiveWordIndex(-1);
     };
