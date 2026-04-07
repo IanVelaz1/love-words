@@ -262,7 +262,7 @@ export function ViewerPlayer({ creation }: Props) {
       {/* Subtle footer */}
       <div className="absolute bottom-6 left-0 right-0 flex justify-center">
         <p className="text-white/15 text-xs font-sans tracking-widest uppercase">
-          Love Words
+          Love Words By Ian Velázquez
         </p>
       </div>
     </div>
