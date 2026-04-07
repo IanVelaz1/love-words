@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
 import { createClient } from "@/lib/supabase/client";
 import { useRouter } from "next/navigation";
@@ -37,6 +38,10 @@ function getExpiryLabel(row: CreationRow): string {
 export default function DashboardPage() {
   const [creations, setCreations] = useState<CreationRow[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [isGuest, setIsGuest] = useState(false);
+  const [claimEmail, setClaimEmail] = useState("");
+  const [claiming, setClaiming] = useState(false);
+  const [claimSent, setClaimSent] = useState(false);
   const router = useRouter();
   const supabase = createClient();
   const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
@@ -46,6 +51,8 @@ export default function DashboardPage() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { router.push("/login"); return; }
 
+      setIsGuest(user.is_anonymous ?? false);
+
       const res = await fetch("/api/creations");
       if (!res.ok) { setIsLoading(false); return; }
       const { creations: data } = await res.json();
@@ -54,6 +61,26 @@ export default function DashboardPage() {
     }
     load();
   }, [router, supabase]);
+
+  async function handleClaimAccount(e: React.FormEvent) {
+    e.preventDefault();
+    setClaiming(true);
+
+    // Link the anonymous session to a real email account
+    const { error } = await supabase.auth.updateUser(
+      { email: claimEmail },
+      { emailRedirectTo: `${window.location.origin}/auth/callback` }
+    );
+
+    setClaiming(false);
+
+    if (error) {
+      toast.error(error.message);
+      return;
+    }
+
+    setClaimSent(true);
+  }
 
   async function handleDelete(id: string) {
     if (!confirm("Delete this love word? This cannot be undone.")) return;
@@ -74,7 +101,7 @@ export default function DashboardPage() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-[#0D0A0E] via-[#1a0a14] to-[#0d1020]">
+    <main className="min-h-screen bg-linear-to-br from-[#0D0A0E] via-[#1a0a14] to-[#0d1020]">
       <header className="flex items-center justify-between px-6 py-5 border-b border-white/5">
         <Link href="/">
           <p className="text-[#D4A843] text-sm tracking-widest uppercase font-sans">
@@ -100,6 +127,52 @@ export default function DashboardPage() {
         <h1 className="font-serif italic text-2xl text-white mb-6">
           My love words
         </h1>
+
+        {/* Guest session banner */}
+        {isGuest && (
+          <div className="bg-[#D4A843]/10 border border-[#D4A843]/20 rounded-2xl p-5 space-y-3 mb-2">
+            <div className="space-y-1">
+              <p className="text-[#D4A843] text-sm font-sans font-medium">
+                Guest session
+              </p>
+              <p className="text-white/50 text-xs font-sans leading-relaxed">
+                Your links work and can be shared. To keep your history across
+                sessions, save your email below.
+              </p>
+            </div>
+
+            {claimSent ? (
+              <p className="text-white/60 text-xs font-sans">
+                Check your email — click the link to save your account. ✓
+              </p>
+            ) : (
+              <form
+                onSubmit={handleClaimAccount}
+                className="flex gap-2 items-center"
+              >
+                <Input
+                  type="email"
+                  value={claimEmail}
+                  onChange={(e) => setClaimEmail(e.target.value)}
+                  placeholder="your@email.com"
+                  required
+                  className="flex-1 bg-white/5 border-white/10 text-white
+                             placeholder:text-white/25 rounded-xl text-sm h-9
+                             focus:ring-[#D4A843] focus:border-[#D4A843]"
+                />
+                <Button
+                  type="submit"
+                  disabled={claiming}
+                  className="bg-[#D4A843] hover:bg-[#c49a38] text-black
+                             rounded-xl px-4 h-9 text-xs font-sans font-medium
+                             shrink-0"
+                >
+                  {claiming ? "Sending…" : "Save account"}
+                </Button>
+              </form>
+            )}
+          </div>
+        )}
 
         {isLoading && (
           <div className="space-y-3">
@@ -149,7 +222,7 @@ export default function DashboardPage() {
               </div>
             </div>
 
-            <div className="flex items-center gap-2 flex-shrink-0">
+            <div className="flex items-center gap-2 shrink-0">
               <button
                 onClick={() => handleCopy(c.slug)}
                 className="text-white/40 hover:text-white text-xs font-sans transition-colors"
