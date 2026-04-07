@@ -95,11 +95,11 @@ export function ViewerPlayer({ creation }: Props) {
   const voiceElRef = useRef<HTMLAudioElement | null>(null);
   const musicElRef = useRef<HTMLAudioElement | null>(null);
 
-  // Web Audio API refs — created inside handlePlay (inside user gesture, required by iOS)
+  // Web Audio API refs — only used for voice (Supabase supports CORS)
+  // Music uses plain HTMLAudioElement.volume since Jamendo CDN lacks CORS headers
   const audioCtxRef = useRef<AudioContext | null>(null);
   const voiceGainRef = useRef<GainNode | null>(null);
-  const musicGainRef = useRef<GainNode | null>(null);
-  const audioInitRef = useRef(false); // createMediaElementSource can only be called once per element
+  const audioInitRef = useRef(false);
 
   const rafRef = useRef<number | null>(null);
 
@@ -124,10 +124,12 @@ export function ViewerPlayer({ creation }: Props) {
 
     if (music_preview_url) {
       const el = new Audio();
-      el.crossOrigin = "anonymous";
+      // No crossOrigin — Jamendo CDN doesn't send CORS headers.
+      // Without this, mobile Safari blocks the resource entirely.
       el.preload = "auto";
       el.loop = true;
       el.src = music_preview_url;
+      el.volume = 0;
       musicElRef.current = el;
     }
 
@@ -163,15 +165,16 @@ export function ViewerPlayer({ creation }: Props) {
     const musicEl = musicElRef.current;
     if (musicEl) musicEl.currentTime = 0;
 
-    // ── Web Audio API setup (first play only) ─────────────────────────────
-    // AudioContext must be created inside a user gesture on iOS Safari
+    // ── Web Audio API setup for voice only (first play) ────────────────────
+    // AudioContext must be created inside a user gesture on iOS Safari.
+    // Music is NOT routed through Web Audio — Jamendo lacks CORS headers,
+    // which causes mobile Safari to block the resource entirely.
     if (!audioInitRef.current) {
       try {
         const ctx = new AudioContext();
         audioCtxRef.current = ctx;
         if (ctx.state === "suspended") await ctx.resume();
 
-        // Voice gain node
         const vGain = ctx.createGain();
         vGain.gain.value = voice_gain;
         vGain.connect(ctx.destination);
@@ -180,45 +183,26 @@ export function ViewerPlayer({ creation }: Props) {
         const vSrc = ctx.createMediaElementSource(voiceEl);
         vSrc.connect(vGain);
 
-        // Music gain node (try CORS; Jamendo CDN supports it)
-        if (musicEl) {
-          try {
-            const mGain = ctx.createGain();
-            mGain.gain.value = 0;
-            mGain.connect(ctx.destination);
-            musicGainRef.current = mGain;
-
-            const mSrc = ctx.createMediaElementSource(musicEl);
-            mSrc.connect(mGain);
-          } catch {
-            // CORS rejected — music falls back to element .volume below
-            musicGainRef.current = null;
-          }
-        }
-
         audioInitRef.current = true;
       } catch {
-        // Web Audio API unavailable — plain HTML audio volume fallback
         voiceEl.volume = voice_gain;
-        if (musicEl) musicEl.volume = music_gain;
       }
     }
 
-    // ── Fade music in ─────────────────────────────────────────────────────
+    // ── Fade music in via element volume (no CORS needed) ────────────────
     if (musicEl) {
-      const ctx = audioCtxRef.current;
-      const mGain = musicGainRef.current;
-      if (ctx && mGain) {
-        // Smooth 3-second ramp via Web Audio API
-        mGain.gain.cancelScheduledValues(ctx.currentTime);
-        mGain.gain.setValueAtTime(0, ctx.currentTime);
-        mGain.gain.linearRampToValueAtTime(music_gain, ctx.currentTime + 3);
-      } else {
-        // Fallback: step volume after a short delay
-        musicEl.volume = 0;
-        setTimeout(() => { if (musicEl) musicEl.volume = music_gain; }, 1500);
-      }
+      musicEl.volume = 0;
       musicEl.play().catch(() => {});
+
+      const target = music_gain;
+      const steps = 30;
+      const intervalMs = 100;
+      let step = 0;
+      const fadeTimer = setInterval(() => {
+        step++;
+        musicEl.volume = Math.min(target, (target * step) / steps);
+        if (step >= steps) clearInterval(fadeTimer);
+      }, intervalMs);
     }
 
     await voiceEl.play();
